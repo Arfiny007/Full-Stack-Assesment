@@ -5,6 +5,9 @@ frontend/dist/
 .env.*
 !.env.example
 coverage/
+.vitest/
+playwright-report/
+test-results/
 .local/
 *.log
 *.pdf

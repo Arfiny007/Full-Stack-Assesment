@@ -15,5 +15,12 @@ services:
       interval: 3s
       timeout: 3s
       retries: 20
+  mqtt-test:
+    image: eclipse-mosquitto:2
+    profiles: ["mqtt-test"]
+    ports:
+      - "127.0.0.1:18884:1883"
+    volumes:
+      - ./scripts/mosquitto-test.conf:/mosquitto/config/mosquitto.conf:ro
 volumes:
   postgres_data:
