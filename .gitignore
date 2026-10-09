@@ -1,0 +1,10 @@
+node_modules/
+dist/
+frontend/dist/
+.env
+.env.*
+!.env.example
+coverage/
+.local/
+*.log
+*.pdf
