@@ -18,7 +18,9 @@ Run from the repository root:
 npm install
 ```
 
-Copy `.env.example` to `.env` (`Copy-Item .env.example .env` in PowerShell, or `cp .env.example .env` in a POSIX shell). The example credentials are disposable local development credentials. `.env` is ignored by Git.
+Copy `.env.example` to `.env` (`Copy-Item .env.example .env` in PowerShell, or `cp .env.example .env` in a POSIX shell). Replace all three `REPLACE_WITH_LOCAL_PASSWORD` placeholders with the same local password; URL-encode it inside the connection URLs if it contains reserved URI characters. Compose reads `POSTGRES_PASSWORD` from ignored `.env`; no working password is supplied in the source template. Keep `CANDIDATE_ID` empty for local-only operation or set the examiner-assigned value for MQTT.
+
+An existing PostgreSQL volume retains its role password: editing environment values does not change the password already stored in PostgreSQL. Keep the URLs consistent with that existing role, or change the role password explicitly before changing the URLs. Do not delete database volumes merely to change configuration.
 
 ```sh
 docker compose up -d

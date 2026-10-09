@@ -3,7 +3,7 @@ services:
     image: postgres:18
     environment:
       POSTGRES_USER: assessment
-      POSTGRES_PASSWORD: assessment_local
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
       POSTGRES_DB: production
     ports:
       - "55432:5432"
