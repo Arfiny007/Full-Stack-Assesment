@@ -1,5 +1,6 @@
 import { z } from "zod";
 const id = z.string().trim().min(1).max(200);
+const quantityMessage = "COUNT quantity must be an integer between 1 and 500.";
 const common = {
   source_id: id,
   event_id: id,
@@ -12,7 +13,14 @@ export const eventSchema = z.discriminatedUnion("type", [
   z.object({
     ...common,
     type: z.literal("COUNT"),
-    quantity: z.number().int().positive().max(2147483647),
+    quantity: z
+      .number({
+        required_error: quantityMessage,
+        invalid_type_error: quantityMessage,
+      })
+      .int(quantityMessage)
+      .min(1, quantityMessage)
+      .max(500, quantityMessage),
     target_event_id: z.null().optional(),
   }),
   z.object({

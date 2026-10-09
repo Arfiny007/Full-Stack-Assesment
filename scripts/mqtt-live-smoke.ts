@@ -72,6 +72,7 @@ try {
     "net_total",
     "pending_ack",
     "processed_events",
+    "rejected_submissions",
     "unresolved",
   ]);
   await send();

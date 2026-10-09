@@ -7,7 +7,8 @@ type Summary = Record<
   | "pending_ack"
   | "unresolved"
   | "duplicates"
-  | "conflicts",
+  | "conflicts"
+  | "rejected_submissions",
   number
 >;
 type Row = {
@@ -55,6 +56,7 @@ const labels: Record<keyof Summary, string> = {
   unresolved: "Unresolved VOIDs",
   duplicates: "Duplicates",
   conflicts: "Conflicts",
+  rejected_submissions: "Rejected Submissions",
 };
 function Badge({ status }: { status: string }) {
   return (
@@ -118,6 +120,25 @@ function App() {
       generation.current++;
     };
   }, [refresh]);
+  function applySource(next: string) {
+    setFilter(next);
+    setSelected(new Set());
+    if (next === source) {
+      void refresh();
+      return;
+    }
+    // Invalidate in-flight responses before the new source's effect runs.
+    generation.current++;
+    setSource(next);
+    setSummary(null);
+    setPending([]);
+    setExceptions([]);
+    setResults([]);
+    setNotice("");
+    setError("");
+    setUpdated("");
+    setLoading(true);
+  }
   async function submit() {
     setError("");
     setNotice("");
@@ -217,8 +238,7 @@ function App() {
         className="filter"
         onSubmit={(e) => {
           e.preventDefault();
-          setSource(filter.trim());
-          setSelected(new Set());
+          if (!loading && !busy) applySource(filter.trim());
         }}
       >
         <label htmlFor="source">Production source</label>
@@ -228,7 +248,14 @@ function App() {
           onChange={(e) => setFilter(e.target.value)}
           placeholder="All sources"
         />
-        <button disabled={loading}>Apply filter</button>
+        <button disabled={loading || busy}>Apply filter</button>
+        <button
+          type="button"
+          disabled={loading || busy || (!source && !filter)}
+          onClick={() => applySource("")}
+        >
+          Clear filter
+        </button>
         <span className="muted">
           {source ? "Showing " + source : "Showing all sources"} · Auto refresh
           every 10s
@@ -237,7 +264,15 @@ function App() {
       <section className="metrics" aria-label="Production summary">
         {Object.entries(labels).map(([k, label]) => (
           <article
-            className={"metric " + (k === "net_total" ? "primary" : "")}
+            className={
+              "metric " +
+              (k === "net_total"
+                ? "primary"
+                : k === "rejected_submissions"
+                  ? "rejections"
+                  : "")
+            }
+            data-metric={k}
             key={k}
           >
             <span>{label}</span>
@@ -249,7 +284,9 @@ function App() {
                 ? "Units after applied corrections"
                 : k === "pending_ack"
                   ? "Ready for supervisor review"
-                  : k === "duplicates" || k === "conflicts"
+                  : k === "duplicates" ||
+                      k === "conflicts" ||
+                      k === "rejected_submissions"
                     ? "Persisted submission attempts"
                     : "Distinct stored events"}
             </small>

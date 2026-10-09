@@ -1,11 +1,14 @@
 import { beforeAll, beforeEach, afterAll, describe, it, expect } from "vitest";
 import request from "supertest";
+import { createHash } from "node:crypto";
 import { app } from "../backend/app.js";
 import { pool, transaction } from "../backend/shared/db/index.js";
 import { migrate } from "../backend/shared/db/migrate.js";
 import { processEvents } from "../backend/modules/events/service.js";
 import { handleChallenge } from "../backend/modules/mqtt/service.js";
 import { summary } from "../backend/modules/state/repository.js";
+import { canonical } from "../backend/modules/events/schema.js";
+import { saveChallenge } from "../backend/modules/mqtt/repository.js";
 import {
   unpublished,
   markPublished,
@@ -16,6 +19,335 @@ const count = (id = "C1", quantity = 12, source = "line-a") => ({
   type: "COUNT",
   quantity,
   event_time: "2026-10-09T08:00:00+06:00",
+});
+
+describe("official COUNT limit and rejected submission metrics", () => {
+  const quantityMessage =
+    "COUNT quantity must be an integer between 1 and 500.";
+  it.each([
+    [1, "ACCEPTED"],
+    [450, "ACCEPTED"],
+    [500, "ACCEPTED"],
+    [501, "REJECTED"],
+    [0, "REJECTED"],
+    [-1, "REJECTED"],
+    [1.5, "REJECTED"],
+  ])(
+    "COUNT quantity %s returns %s and persists its outcome without invalid effects",
+    async (quantity, expected) => {
+      const event = count("BOUNDARY", quantity as number, "LINE-01");
+      const response = await request(app)
+        .post("/api/events")
+        .send(event)
+        .expect(200);
+      expect(response.body.results[0].status).toBe(expected);
+      const accepted = expected === "ACCEPTED";
+      if (!accepted)
+        expect(response.body.results[0].message).toContain(quantityMessage);
+      const state = (
+        await request(app).get("/api/state?source_id=LINE-01").expect(200)
+      ).body.summary;
+      expect(state).toEqual({
+        net_total: accepted ? quantity : 0,
+        processed_events: accepted ? 1 : 0,
+        pending_ack: accepted ? 1 : 0,
+        unresolved: 0,
+        duplicates: 0,
+        conflicts: 0,
+        rejected_submissions: accepted ? 0 : 1,
+      });
+      const attempts = (
+        await pool.query(
+          "SELECT source_id,status,original_payload,message FROM submission_attempts",
+        )
+      ).rows;
+      expect(attempts).toHaveLength(1);
+      expect(attempts[0]).toMatchObject({
+        source_id: "LINE-01",
+        status: expected,
+        original_payload: event,
+      });
+      if (!accepted) {
+        expect(attempts[0].message).toContain(quantityMessage);
+        expect(
+          (await pool.query("SELECT COUNT(*)::int AS n FROM production_events"))
+            .rows[0].n,
+        ).toBe(0);
+        const exceptions = (
+          await request(app).get("/api/state?view=exceptions&source_id=LINE-01")
+        ).body.exceptions;
+        expect(exceptions).toHaveLength(1);
+        expect(exceptions[0]).toMatchObject({
+          event_id: "BOUNDARY",
+          source_id: "LINE-01",
+          status: "REJECTED",
+          kind: "attempt",
+        });
+      }
+    },
+  );
+
+  it("mixed COUNT 450/501 batch preserves order, commits 450 and audits 501", async () => {
+    const response = await request(app)
+      .post("/api/events")
+      .send([count("OK", 450), count("TOO-LARGE", 501)])
+      .expect(200);
+    expect(response.body.results.map((r: any) => r.status)).toEqual([
+      "ACCEPTED",
+      "REJECTED",
+    ]);
+    expect(await summary()).toMatchObject({
+      net_total: 450,
+      processed_events: 1,
+      rejected_submissions: 1,
+    });
+    expect(
+      (
+        await pool.query("SELECT status FROM submission_attempts ORDER BY id")
+      ).rows.map((r) => r.status),
+    ).toEqual(["ACCEPTED", "REJECTED"]);
+  });
+
+  it("two source filters count repeated rejected attempts independently; sourceless attempts only unfiltered", async () => {
+    await processEvents([
+      count("OK", 450, "LINE-01"),
+      count("BAD", 501, "LINE-01"),
+      count("BAD", 501, "LINE-01"),
+      count("BAD", 501, "LINE-02"),
+      {
+        event_id: "NO-SOURCE",
+        type: "COUNT",
+        quantity: 501,
+        event_time: count().event_time,
+      },
+    ]);
+    const get = async (source?: string) =>
+      (
+        await request(app)
+          .get(
+            "/api/state" +
+              (source ? "?source_id=" + encodeURIComponent(source) : ""),
+          )
+          .expect(200)
+      ).body.summary;
+    expect(await get("LINE-01")).toMatchObject({
+      net_total: 450,
+      processed_events: 1,
+      rejected_submissions: 2,
+    });
+    expect(await get("LINE-02")).toMatchObject({
+      net_total: 0,
+      processed_events: 0,
+      rejected_submissions: 1,
+    });
+    expect((await get()).rejected_submissions).toBe(4);
+    expect((await get("EMPTY")).rejected_submissions).toBe(0);
+    const pending = (
+      await request(app).get("/api/state?view=pending&source_id=LINE-01")
+    ).body.pending;
+    expect(pending).toHaveLength(1);
+    expect(pending[0].source_id).toBe("LINE-01");
+    expect(
+      (await request(app).get("/api/state?view=pending&source_id=LINE-02")).body
+        .pending,
+    ).toHaveLength(0);
+    expect(
+      (await request(app).get("/api/state?view=exceptions&source_id=LINE-01"))
+        .body.exceptions,
+    ).toHaveLength(2);
+    expect(
+      (await request(app).get("/api/state?view=exceptions&source_id=LINE-02"))
+        .body.exceptions,
+    ).toHaveLength(1);
+  });
+
+  it("rejected_submissions counts REJECTED attempts only, without double counting rejected event rows", async () => {
+    await processEvents([
+      count("C", 10),
+      count("C", 10),
+      count("C", 11),
+      voidEvent("PENDING", "MISSING"),
+      voidEvent("SELF", "SELF"),
+      count("BAD", 501),
+      count("BAD", 501),
+    ]);
+    expect(await summary()).toEqual({
+      net_total: 10,
+      processed_events: 1,
+      pending_ack: 1,
+      unresolved: 1,
+      duplicates: 1,
+      conflicts: 1,
+      rejected_submissions: 3,
+    });
+    expect(
+      (
+        await pool.query(
+          "SELECT COUNT(*)::int AS n FROM production_events WHERE status='REJECTED'",
+        )
+      ).rows[0].n,
+    ).toBe(1);
+    expect(
+      (
+        await pool.query(
+          "SELECT COUNT(*)::int AS n FROM submission_attempts WHERE status='REJECTED'",
+        )
+      ).rows[0].n,
+    ).toBe(3);
+  });
+
+  it("MQTT COUNT 501 remains COMPLETED with seven-field state, durable rejection and exact replay", async () => {
+    const body = challenge("MQ-LIMIT", [count("MQ-BAD", 501, "LINE-MQ")]);
+    const first = await handleChallenge(body, "integration-only");
+    expect(first.status).toBe("COMPLETED");
+    expect(first.results).toEqual([
+      expect.objectContaining({
+        event_id: "MQ-BAD",
+        status: "REJECTED",
+        message: expect.stringContaining(quantityMessage),
+      }),
+    ]);
+    expect(first.state).toEqual({
+      net_total: 0,
+      processed_events: 0,
+      pending_ack: 0,
+      unresolved: 0,
+      duplicates: 0,
+      conflicts: 0,
+      rejected_submissions: 1,
+    });
+    expect(
+      (
+        await pool.query(
+          "SELECT source_id,transport,status FROM submission_attempts",
+        )
+      ).rows,
+    ).toEqual([
+      { source_id: "LINE-MQ", transport: "MQTT", status: "REJECTED" },
+    ]);
+    expect(await handleChallenge(body, "integration-only")).toEqual(first);
+    expect(
+      (await pool.query("SELECT COUNT(*)::int AS n FROM submission_attempts"))
+        .rows[0].n,
+    ).toBe(1);
+    const stored = (
+      await pool.query("SELECT serialized_response FROM mqtt_challenges")
+    ).rows[0].serialized_response;
+    expect(stored).toBe(JSON.stringify(first));
+  });
+
+  it("MQTT mixed COUNT 450/501 uses the same rule and includes REST and MQTT rejections", async () => {
+    await processEvents([count("REST-BAD", 501, "LINE-MQ")]);
+    const response = await handleChallenge(
+      challenge("MQ-MIXED", [
+        count("MQ-OK", 450, "LINE-MQ"),
+        count("MQ-BAD", 501, "LINE-MQ"),
+      ]),
+      "integration-only",
+    );
+    expect(response.status).toBe("COMPLETED");
+    expect((response.results as any[]).map((r) => r.status)).toEqual([
+      "ACCEPTED",
+      "REJECTED",
+    ]);
+    expect(response.state).toMatchObject({
+      net_total: 450,
+      processed_events: 1,
+      rejected_submissions: 2,
+    });
+    expect((await summary("LINE-MQ")).rejected_submissions).toBe(2);
+  });
+
+  it("historical six-field MQTT responses and COUNT above 500 stay intact during replay", async () => {
+    const body = challenge("LEGACY", [count("OLD-C", 750, "LEGACY-LINE")]);
+    const oldResponse = {
+      protocol_version: "1.0",
+      candidate_id: "integration-only",
+      challenge_id: "LEGACY",
+      status: "COMPLETED",
+      processed_at: "2026-10-08T00:00:00Z",
+      results: [
+        {
+          event_id: "OLD-C",
+          source_id: "LEGACY-LINE",
+          status: "ACCEPTED",
+          message: "Event processed",
+        },
+      ],
+      state: {
+        net_total: 750,
+        processed_events: 1,
+        pending_ack: 1,
+        unresolved: 0,
+        duplicates: 0,
+        conflicts: 0,
+      },
+    };
+    // Fixture models data committed under the previous contract, not processing through today's validator.
+    await transaction(async (db) => {
+      await db.query("INSERT INTO production_sources(source_id) VALUES($1)", [
+        "LEGACY-LINE",
+      ]);
+      await db.query(
+        "INSERT INTO production_events(source_id,event_id,type,quantity,event_time,original_payload,normalized_payload,status) VALUES($1,$2,'COUNT',750,$3,$4,$5,'ACCEPTED')",
+        [
+          "LEGACY-LINE",
+          "OLD-C",
+          body.events[0] && count().event_time,
+          JSON.stringify(body.events[0]),
+          JSON.stringify({
+            ...count("OLD-C", 750, "LEGACY-LINE"),
+            target_event_id: null,
+            event_time: "2026-10-09T02:00:00.000Z",
+          }),
+        ],
+      );
+      const canon = canonical(body);
+      await saveChallenge(
+        db,
+        "integration-only",
+        "LEGACY",
+        canon,
+        createHash("sha256").update(canon).digest("hex"),
+        oldResponse,
+      );
+    });
+    const original = (
+      await pool.query(
+        "SELECT serialized_response FROM mqtt_challenges WHERE challenge_id='LEGACY'",
+      )
+    ).rows[0].serialized_response;
+    expect(await handleChallenge(body, "integration-only")).toEqual(
+      oldResponse,
+    );
+    expect(
+      (
+        await pool.query(
+          "SELECT serialized_response FROM mqtt_challenges WHERE challenge_id='LEGACY'",
+        )
+      ).rows[0].serialized_response,
+    ).toBe(original);
+    expect(
+      (await pool.query("SELECT COUNT(*)::int AS n FROM submission_attempts"))
+        .rows[0].n,
+    ).toBe(0);
+    expect((await summary()).net_total).toBe(750);
+    const fresh = await handleChallenge(
+      challenge("AFTER-CHANGE", []),
+      "integration-only",
+    );
+    expect(fresh.state).toEqual({
+      ...oldResponse.state,
+      rejected_submissions: 0,
+    });
+    expect(
+      (
+        await pool.query(
+          "SELECT quantity,status FROM production_events WHERE event_id='OLD-C'",
+        )
+      ).rows[0],
+    ).toEqual({ quantity: 750, status: "ACCEPTED" });
+  });
 });
 const voidEvent = (id = "V1", target = "C1", source = "line-a") => ({
   source_id: source,
@@ -40,7 +372,7 @@ beforeEach(async () => {
 });
 afterAll(() => pool.end());
 describe("PostgreSQL REST and shared business service", () => {
-  it("new COUNT increases real database total and exposes exactly six indicators", async () => {
+  it("new COUNT increases real database total and exposes exactly seven indicators", async () => {
     const response = await request(app)
       .post("/api/events")
       .send(count())
@@ -54,6 +386,7 @@ describe("PostgreSQL REST and shared business service", () => {
       unresolved: 0,
       duplicates: 0,
       conflicts: 0,
+      rejected_submissions: 0,
     });
     expect(state.mqtt.enabled).toBe(false);
   });

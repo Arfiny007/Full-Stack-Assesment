@@ -114,7 +114,7 @@ input:not([type="checkbox"]) {
 }
 .metrics {
   display: grid;
-  grid-template-columns: repeat(6, 1fr);
+  grid-template-columns: repeat(7, minmax(0, 1fr));
   gap: 12px;
   margin-bottom: 24px;
 }
@@ -141,6 +141,13 @@ input:not([type="checkbox"]) {
 }
 .metric.primary small {
   color: #b1d1bc;
+}
+.metric.rejections {
+  background: #fff2ee;
+  border-color: #e7c1b6;
+}
+.metric.rejections strong {
+  color: #b54535;
 }
 .workspace {
   display: grid;

@@ -114,6 +114,15 @@ try {
   const original = responses[0];
   assert.equal(JSON.parse(original).status, "COMPLETED");
   assert.equal(JSON.parse(original).results[0].status, "ACCEPTED");
+  assert.deepEqual(Object.keys(JSON.parse(original).state).sort(), [
+    "conflicts",
+    "duplicates",
+    "net_total",
+    "pending_ack",
+    "processed_events",
+    "rejected_submissions",
+    "unresolved",
+  ]);
   await publish(body);
   await waitFor(() => responses.length >= 2, "Replay response");
   assert.equal(responses[1], original);
@@ -183,8 +192,49 @@ try {
     )
   ).rows[0];
   assert.equal(outbox.n, 0);
+  const invalidBody = {
+    ...body,
+    challenge_id: "LOCAL-LIMIT-501",
+    events: [{ ...body.events[0], event_id: "LOCAL-BAD", quantity: 501 }],
+  };
+  await publish(invalidBody);
+  await waitFor(
+    () =>
+      responses.some((s) => JSON.parse(s).challenge_id === "LOCAL-LIMIT-501"),
+    "MQTT quantity rejection",
+  );
+  const invalidResponse = JSON.parse(
+    responses.find((s) => JSON.parse(s).challenge_id === "LOCAL-LIMIT-501")!,
+  );
+  assert.equal(invalidResponse.status, "COMPLETED");
+  assert.equal(invalidResponse.results[0].status, "REJECTED");
+  assert.match(invalidResponse.results[0].message, /integer between 1 and 500/);
+  const actualRejected = (
+    await pool.query(
+      "SELECT COUNT(*)::int AS n FROM submission_attempts WHERE status='REJECTED'",
+    )
+  ).rows[0].n;
+  assert.equal(invalidResponse.state.rejected_submissions, actualRejected);
+  assert.equal(
+    (
+      await pool.query(
+        "SELECT SUM(quantity)::int AS n FROM production_events WHERE source_id=$1 AND type='COUNT'",
+        [candidate],
+      )
+    ).rows[0].n,
+    35,
+  );
+  assert.equal(
+    (
+      await pool.query(
+        "SELECT COUNT(*)::int AS n FROM submission_attempts WHERE source_id=$1 AND transport='MQTT' AND status='REJECTED'",
+        [candidate],
+      )
+    ).rows[0].n,
+    1,
+  );
   console.log(
-    "PASS: local real MQTT QoS1, ONLINE, HEARTBEAT, OFFLINE will, replay, restart, conflict and durable outbox; PostgreSQL effects applied once.",
+    "PASS: local real MQTT QoS1, ONLINE, HEARTBEAT, OFFLINE will, replay, restart, conflict, durable outbox and COUNT 501 rejection with seven state fields; PostgreSQL effects applied once.",
   );
 } finally {
   await stop();

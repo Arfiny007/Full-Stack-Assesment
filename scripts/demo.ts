@@ -42,4 +42,20 @@ assert.deepEqual(
   ).results.map((r: any) => r.status),
   ["ACKED", "ALREADY_ACKED", "ALREADY_ACKED"],
 );
-console.log("Demo passed; durable history remains under source " + source);
+const limitedCount = { ...count, event_id: "LIMIT-450", quantity: 450 };
+const rejectedCount = { ...count, event_id: "LIMIT-501", quantity: 501 };
+assert.deepEqual(
+  (await call("/api/events", [limitedCount, rejectedCount])).results.map(
+    (r: any) => r.status,
+  ),
+  ["ACCEPTED", "REJECTED"],
+);
+const changedSummary = (await call("/api/state?source_id=" + source)).summary;
+assert.equal(changedSummary.net_total, 450);
+assert.equal(changedSummary.processed_events, 3);
+assert.equal(changedSummary.rejected_submissions, 1);
+assert.equal(Object.keys(changedSummary).length, 7);
+console.log(
+  "Demo passed: COUNT 450 accepted, COUNT 501 rejected and counted; durable history remains under source " +
+    source,
+);
